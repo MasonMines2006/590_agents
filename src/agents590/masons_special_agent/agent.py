@@ -1,19 +1,37 @@
 """The course starter agent, independent of Harbor."""
 
 import asyncio
+import json
 from pathlib import Path
+from typing import Any
 
 from openai.types.responses import (
     FunctionToolParam,
     Response,
     ResponseFunctionToolCall,
-    ResponseInputItemParam,
 )
 
 from agents590.contracts import RunContext
 from agents590.provider import UNCOpenAISettings
 
-ALLOWED_COMMANDS = ["ls", "pwd", "echo", "cat", "head"]
+ALLOWED_COMMANDS = [
+    "pwd",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "grep",
+    "rg",
+    "find",
+    "sed",
+    "sort",
+    "diff",
+    "git",
+    "python3",
+    "pytest",
+    "uv",
+    "make",
+]
 
 
 class MasonsSpecialAgent:
@@ -77,6 +95,21 @@ class MasonsSpecialAgent:
         else:
             return "this part should never be reached lol its for the type checker"
 
+    async def handle_tool_call(self, action: ResponseFunctionToolCall, cwd: Path) -> str:
+        """Run one tool call and always return text for the model, even on errors."""
+        if action.name != "shell":
+            return f"[stderr]\nUnknown tool: {action.name}"
+
+        # action.arguments is a JSON string like '{"command": "ls"}', not a dict.
+        try:
+            cmd = json.loads(action.arguments)["command"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            cmd = None
+        if not isinstance(cmd, str) or not cmd:
+            return "[stderr]\nNo command provided to shell tool."
+
+        return await self.tool_shell(cmd, cwd=cwd)
+
     async def run(self, instruction: str, context: RunContext) -> str:
         # Start with settings = self.provider_settings(context), then open
         # settings.create_async_client() and use model=settings.model.
@@ -87,7 +120,7 @@ class MasonsSpecialAgent:
         max_loops = 20
 
         async with UNC_provider.create_async_client() as UNC_client:
-            items: list[ResponseInputItemParam] = [{"role": "user", "content": instruction}]
+            items: list[Any] = [{"role": "user", "content": instruction}]
 
             for _loop in range(max_loops):
                 UNC_client_response: Response = await UNC_client.responses.create(
@@ -117,11 +150,18 @@ class MasonsSpecialAgent:
                 if not actions:
                     return UNC_client_response.output_text
 
-                items.append({"role": "assistant", "content": UNC_client_response.output_text})
+                items += UNC_client_response.output
 
-                for item in UNC_client_response.output:
-                    if not isinstance(item, ResponseFunctionToolCall):
-                        continue
+                # Every function_call needs a function_call_output with the same call_id.
+                for action in actions:
+                    output = await self.handle_tool_call(action, context.cwd)
+                    items += [
+                        {
+                            "type": "function_call_output",
+                            "call_id": action.call_id,
+                            "output": output,
+                        }
+                    ]
 
         # output = UNC_client_response.output
 
