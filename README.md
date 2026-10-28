@@ -96,7 +96,7 @@ The sibling `evals/` repository supplies the generic installed-agent adapter:
 ```sh
 cd ../agent_evals
 make agent AGENT=krisj_echo
-make agent AGENT=masons_special_agent MODEL=openai/YOUR_DEPLOYMENT ENV_FILE=../590_agents/.env
+make agent AGENT=my-agent MODEL=openai/YOUR_DEPLOYMENT ENV_FILE=../590_agents/.env
 ```
 
 The second command requires that agent to be registered and implemented and may
