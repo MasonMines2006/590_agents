@@ -136,12 +136,6 @@ def shell_environment() -> dict[str, str]:
     return {**inherited, **NON_INTERACTIVE_ENV}
 
 
-def resolve_path(raw_path: str, cwd: Path) -> Path:
-    """Treat relative paths as relative to the agent's working directory."""
-    path = Path(raw_path).expanduser()
-    return path if path.is_absolute() else cwd / path
-
-
 # Offered only to agents that are allowed to delegate (see tool_definitions).
 DELEGATE_TOOL: FunctionToolParam = {
     "type": "function",
