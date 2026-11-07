@@ -18,6 +18,23 @@ uv run python -m agents590 krisj_echo --instruction "The same shared entry point
 directory, `--model` overrides the agent's model, and `--env-file` explicitly loads
 configuration without overriding variables already exported in the shell.
 
+Phase A run controls make repeated local use easier without changing the existing
+invocation contract. `--session NAME` labels a run, while `--state-dir DIR` saves a
+human-readable JSON record and makes `--resume RUN_ID` possible. `--plan` requests
+plan-only behavior from agents that support it; `--auto-approve` is an explicit
+opt-in and is never the default. `--jsonl` emits one machine-readable result line,
+`--quiet` suppresses the response, and `--verbose` shows run metadata. Resource
+bounds are available through `--max-turns`, `--max-tool-calls`, and `--max-seconds`.
+For example:
+
+```sh
+uv run agents590-chat --env-file .env --session coding --max-turns 20 \
+  -i "Inspect the tests and explain the next fix"
+# Follow-up: the coding agent receives the prior conversation automatically.
+uv run agents590-chat --env-file .env --session coding -i "Now implement that fix and run the tests"
+uv run agents590 masons_special_agent --state-dir .agents590 --resume RUN_ID
+```
+
 The `krisj_echo` agent returns the instruction without tools or API requests. The
 `krisj_starter` agent is the migrated course scaffold: its model/tool loop intentionally
 raises `NotImplementedError` until implemented. Its settings already support
@@ -43,7 +60,7 @@ run `uv sync` after changing entry-point registrations in `pyproject.toml`.
    `[project.entry-points."agents590.agents"]`, then run `uv sync`.
 4. Add pytest tests and run `make check` and `make test`.
 
-`agents590 my-agent -i "..."` and `python -m agents590 my-agent -i "..."`
+`agents590 my-agent -i "..."` and `python -m agents590 <agent> -i "..."`
 then use the same implementation. Entry points also allow separately installed
 packages to register additional agents. Duplicate names produce an error.
 
@@ -65,8 +82,7 @@ request through the migrated smoke command, run `make smoke`.
 | `OPENAI_ENDPOINT` | `AZURE_OPENAI_ENDPOINT` | HTTPS origin; defaults to `https://azureaiapi.cloud.unc.edu` |
 
 The explicit `--model` wins over environment defaults. The provider removes an
-optional `openai/` prefix, preserves the deployment alias, and sends standard
-OpenAI SDK requests to the UNC `/openai/v1/` gateway with bearer authentication.
+optional `openai/` prefix, preserves the deployment alias, and sends standard OpenAI SDK requests to the UNC `/openai/v1/` gateway with bearer authentication.
 Requests use `store=False` and `background=False`. Blank explicit settings fail;
 public OpenAI endpoints are rejected. `OPENAI_BASE_URL` is ignored because the
 client sets its base URL explicitly. Keep `.env` private; it is excluded from

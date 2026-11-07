@@ -15,6 +15,7 @@ from openai.types.responses import (
 )
 
 from agents590.contracts import RunContext
+from agents590.masons_special_agent.policy import check_path
 from agents590.masons_special_agent.tracing import RunTracer, configure_logging, logger
 from agents590.provider import UNCOpenAISettings
 
@@ -194,11 +195,11 @@ class MasonsSpecialAgent:
         )
 
     def tool_read_file(self, raw_path: str, cwd: Path) -> str:
-        path = resolve_path(raw_path, cwd)
         try:
+            path = check_path(raw_path, cwd)
             text = path.read_text()
-        except (OSError, UnicodeDecodeError) as error:
-            return f"[error] Could not read {path}: {error}"
+        except (OSError, UnicodeDecodeError, ValueError) as error:
+            return f"[error] Could not read {raw_path}: {error}"
         if len(text) <= MAX_OUTPUT_CHARS:
             return text
         # Rewriting a file from a cut-off copy would silently delete its end, so say so.
@@ -208,12 +209,12 @@ class MasonsSpecialAgent:
         )
 
     def tool_write_file(self, raw_path: str, content: str, cwd: Path) -> str:
-        path = resolve_path(raw_path, cwd)
         try:
+            path = check_path(raw_path, cwd, write=True)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content)
-        except OSError as error:
-            return f"[error] Could not write {path}: {error}"
+        except (OSError, ValueError) as error:
+            return f"[error] Could not write {raw_path}: {error}"
         return f"Wrote {len(content)} characters to {path}"
 
     async def handle_tool_call(self, action: ResponseFunctionToolCall, cwd: Path) -> str:

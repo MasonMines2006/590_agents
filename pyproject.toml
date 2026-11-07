@@ -11,6 +11,7 @@ dependencies = [
 
 [project.scripts]
 agents590 = "agents590.cli:main"
+agents590-chat = "agents590.cli:chat_main"
 openai-smoke = "agents590.smoke:main"
 
 [project.entry-points."agents590.agents"]
