@@ -55,6 +55,8 @@ SHELL_TIMEOUT_SECONDS = 60
 # Long outputs (a huge file, a noisy test run) would flood the model's context,
 # so every tool result is cut to this many characters.
 MAX_OUTPUT_CHARS = 10_000
+# A repo's AGENTS.md goes into the system prompt on every model call, so cap it.
+MAX_AGENTS_MD_CHARS = 4_000
 
 # Git opens an editor for commit messages and `rebase --continue`, and a pager
 # for `log`/`diff`. Nobody can type into those here, so the command would hang
@@ -96,6 +98,27 @@ def truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n...[truncated {len(text) - limit} characters]"
+
+
+def project_conventions(cwd: Path) -> str:
+    """Return the repo's AGENTS.md as a system-prompt section, or "" if there is none.
+
+    AGENTS.md is where a repository writes down its rules for coding agents
+    ("run make test", "add a docstring to every function", ...). Putting it in
+    the system prompt means the model sees it before its first tool call.
+    """
+    path = cwd / "AGENTS.md"
+    if not path.is_file():
+        return ""
+    try:
+        text = path.read_text().strip()
+    except (OSError, UnicodeDecodeError) as error:
+        logger.info("could not read AGENTS.md: %s", error)
+        return ""
+    if not text:
+        return ""
+    logger.info("loaded AGENTS.md (%d characters)", len(text))
+    return "\n\nProject conventions (from AGENTS.md):\n" + truncate(text, MAX_AGENTS_MD_CHARS)
 
 
 def resolve_path(raw_path: str, cwd: Path) -> Path:
@@ -276,6 +299,7 @@ class MasonsSpecialAgent:
         configure_logging()
         UNC_provider = self.provider_settings(context)
         instructions = SYSTEM_PROMPT.format(commands=", ".join(ALLOWED_COMMANDS))
+        instructions += project_conventions(context.cwd)
         if context.plan_only:
             instructions += PLAN_MODE_PROMPT.format(commands=", ".join(sorted(READ_ONLY_COMMANDS)))
         tracer = RunTracer(model=UNC_provider.model)
