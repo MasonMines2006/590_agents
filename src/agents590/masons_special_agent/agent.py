@@ -15,7 +15,11 @@ from openai.types.responses import (
 )
 
 from agents590.contracts import RunContext
-from agents590.masons_special_agent.policy import check_path
+from agents590.masons_special_agent.policy import (
+    READ_ONLY_COMMANDS,
+    check_path,
+    plan_mode_refusal,
+)
 from agents590.masons_special_agent.tracing import RunTracer, configure_logging, logger
 from agents590.provider import UNCOpenAISettings
 
@@ -45,6 +49,7 @@ ALLOWED_COMMANDS = [
     "make",
 ]
 
+# Default number of model calls per run; `--max-turns` overrides it.
 MAX_LOOPS = 30
 SHELL_TIMEOUT_SECONDS = 60
 # Long outputs (a huge file, a noisy test run) would flood the model's context,
@@ -76,6 +81,14 @@ Rules:
   command failed; read stderr and fix the problem before continuing.
 - Do not edit, create, or delete files the task does not ask about.
 - When you are done, reply with a short summary of what you changed."""
+
+PLAN_MODE_PROMPT = """
+PLAN MODE (--plan): this run is read-only. Do not change anything.
+- write_file is disabled.
+- The shell only runs these read-only commands: {commands}, plus
+  `git status|log|diff|show`. Redirects (>), `;`, `&&` and `$(...)` are refused.
+- Inspect the code, then reply with a step-by-step plan: the files to change,
+  what to change in each, and how to verify it."""
 
 
 def truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
@@ -217,8 +230,9 @@ class MasonsSpecialAgent:
             return f"[error] Could not write {raw_path}: {error}"
         return f"Wrote {len(content)} characters to {path}"
 
-    async def handle_tool_call(self, action: ResponseFunctionToolCall, cwd: Path) -> str:
+    async def handle_tool_call(self, action: ResponseFunctionToolCall, context: RunContext) -> str:
         """Run one tool call and always return text for the model, even on errors."""
+        cwd = context.cwd
         # action.arguments is a JSON string like '{"command": "ls"}', not a dict.
         try:
             parsed: object = json.loads(action.arguments)
@@ -236,6 +250,11 @@ class MasonsSpecialAgent:
         if action.name == "shell":
             if not isinstance(command, str):
                 return "[error] shell needs a 'command' string."
+            if context.plan_only:
+                refusal = plan_mode_refusal(command)
+                if refusal is not None:
+                    logger.info("shell %r refused: %s", command, refusal)
+                    return f"[error] {refusal}"
             return await self.tool_shell(command, cwd=cwd)
         if action.name == "read_file":
             if not isinstance(path, str):
@@ -245,6 +264,9 @@ class MasonsSpecialAgent:
         if action.name == "write_file":
             if not isinstance(path, str) or not isinstance(content, str):
                 return "[error] write_file needs 'path' and 'content' strings."
+            if context.plan_only:
+                logger.info("write_file %s refused: plan mode", path)
+                return "[error] write_file is disabled in --plan mode (read-only)."
             logger.info("write_file %s (%d characters)", path, len(content))
             return self.tool_write_file(path, content, cwd)
         logger.info("unknown tool %s", action.name)
@@ -254,6 +276,8 @@ class MasonsSpecialAgent:
         configure_logging()
         UNC_provider = self.provider_settings(context)
         instructions = SYSTEM_PROMPT.format(commands=", ".join(ALLOWED_COMMANDS))
+        if context.plan_only:
+            instructions += PLAN_MODE_PROMPT.format(commands=", ".join(sorted(READ_ONLY_COMMANDS)))
         tracer = RunTracer(model=UNC_provider.model)
         tracer.record_instruction(instruction)
 
@@ -274,8 +298,11 @@ class MasonsSpecialAgent:
     ) -> str:
         async with UNC_provider.create_async_client() as UNC_client:
             items: list[Any] = [{"role": "user", "content": instruction}]
+            # `or` falls back to the default when the flag was not given (None).
+            max_turns = context.max_turns or MAX_LOOPS
+            tool_calls_made = 0
 
-            for _loop in range(MAX_LOOPS):
+            for _turn in range(max_turns):
                 UNC_client_response: Response = await UNC_client.responses.create(
                     model=UNC_provider.model,
                     input=items,
@@ -298,7 +325,12 @@ class MasonsSpecialAgent:
 
                 # Every function_call needs a function_call_output with the same call_id.
                 for action in actions:
-                    output = await self.handle_tool_call(action, context.cwd)
+                    limit = context.max_tool_calls
+                    if limit is not None and tool_calls_made >= limit:
+                        logger.info("stopping: reached --max-tool-calls %d", limit)
+                        return f"Stopped: reached the limit of {limit} tool calls."
+                    tool_calls_made += 1
+                    output = await self.handle_tool_call(action, context)
                     tracer.record_tool_result(action.call_id, output)
                     items += [
                         {
@@ -308,4 +340,4 @@ class MasonsSpecialAgent:
                         }
                     ]
 
-        return f"Could not finish the task in {MAX_LOOPS} model calls."
+        return f"Could not finish the task in {max_turns} model calls."

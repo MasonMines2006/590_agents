@@ -26,11 +26,9 @@ class Arguments(argparse.Namespace):
     env_file: Path | None
     list_agents: bool
     plan: bool
-    auto_approve: bool
     session: str | None
     resume: str | None
     state_dir: Path | None
-    vault: Path | None
     jsonl: bool
     quiet: bool
     verbose: bool
@@ -38,7 +36,6 @@ class Arguments(argparse.Namespace):
     log_file: Path | None
     max_turns: int | None
     max_tool_calls: int | None
-    max_seconds: int | None
 
 
 def _positive(value: str) -> int:
@@ -99,22 +96,23 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("-m", "--model", help="Per-run model/deployment override")
     parser.add_argument("--env-file", type=Path, help="Explicit environment file to load")
     parser.add_argument("--list", dest="list_agents", action="store_true", help="List agents")
-    parser.add_argument("--plan", action="store_true", help="Plan only; do not mutate files")
-    parser.add_argument("--auto-approve", action="store_true", help="Explicitly allow actions")
+    # --plan, --max-turns and --max-tool-calls are passed to the agent in RunContext;
+    # each agent decides whether it honors them (masons_special_agent does).
+    parser.add_argument(
+        "--plan", action="store_true", help="Read-only run that ends with a plan (if supported)"
+    )
     parser.add_argument("--session", help="Session name; conversation context is saved locally")
     parser.add_argument("--resume", metavar="RUN_ID", help="Resume the instruction saved for a run")
     parser.add_argument("--state-dir", type=Path, help="Directory for persistent run records")
-    parser.add_argument(
-        "--vault", type=Path, help="Optional existing vault path recorded with the run"
-    )
     parser.add_argument("--jsonl", action="store_true", help="Print one JSON result line")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress the final response")
     parser.add_argument("-v", "--verbose", action="store_true", help="Include run metadata")
     parser.add_argument("--trace", action="store_true", help="Print timing details to stderr")
     parser.add_argument("--log-file", type=Path, help="Append timing details to a log file")
-    parser.add_argument("--max-turns", type=_positive, help="Maximum model turns")
-    parser.add_argument("--max-tool-calls", type=_positive, help="Maximum tool calls")
-    parser.add_argument("--max-seconds", type=_positive, help="Maximum run duration in seconds")
+    parser.add_argument("--max-turns", type=_positive, help="Maximum model calls (if supported)")
+    parser.add_argument(
+        "--max-tool-calls", type=_positive, help="Maximum tool calls (if supported)"
+    )
     return parser
 
 
@@ -135,9 +133,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("--env-file must name an existing file")
         load_dotenv(env_file, override=False)
     state_dir = args.state_dir.expanduser().resolve() if args.state_dir else cwd / ".agents590"
-    vault = args.vault.expanduser().resolve() if args.vault else None
-    if vault is not None and not vault.is_dir():
-        parser.error("--vault must name an existing directory")
 
     # Only touch the disk when the user asked for persistence. A plain
     # `agents590 <agent> -i "..."` run (how Harbor calls us, with cwd = the task
@@ -179,7 +174,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "cwd": str(cwd),
                     "session": args.session,
                     "model": args.model,
-                    "vault": str(vault) if vault else None,
                 },
             )
     except OSError as error:
@@ -195,14 +189,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         cwd=cwd,
         model=args.model,
         plan_only=args.plan,
-        auto_approve=args.auto_approve,
         session=args.session,
         run_id=context_run_id,
         max_turns=args.max_turns,
         max_tool_calls=args.max_tool_calls,
-        max_seconds=args.max_seconds,
         state_dir=context_state_dir,
-        vault=vault,
     )
     started = time.monotonic()
     try:

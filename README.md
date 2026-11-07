@@ -20,12 +20,16 @@ configuration without overriding variables already exported in the shell.
 
 Phase A run controls make repeated local use easier without changing the existing
 invocation contract. `--session NAME` labels a run, while `--state-dir DIR` saves a
-human-readable JSON record and makes `--resume RUN_ID` possible. `--plan` requests
-plan-only behavior from agents that support it; `--auto-approve` is an explicit
-opt-in and is never the default. `--jsonl` emits one machine-readable result line,
-`--quiet` suppresses the response, and `--verbose` shows run metadata. Resource
-bounds are available through `--max-turns`, `--max-tool-calls`, and `--max-seconds`.
-For example:
+human-readable JSON record and makes `--resume RUN_ID` possible. Run records are
+only written when one of those three flags is given, so a plain `-i` run (how Harbor
+calls the CLI) leaves no files behind. `--jsonl` emits one machine-readable result
+line, `--quiet` suppresses the response, and `--verbose` shows run metadata.
+
+Agent-specific controls are passed through `RunContext`; `masons_special_agent`
+honors all of them, other agents may ignore them. `--plan` makes the run read-only
+(`write_file` is refused and the shell only runs read-only commands) and asks for a
+plan. `--max-turns` caps model calls (default 30) and `--max-tool-calls` caps tool
+calls. For example:
 
 ```sh
 uv run agents590-chat --env-file .env --session coding --max-turns 20 \

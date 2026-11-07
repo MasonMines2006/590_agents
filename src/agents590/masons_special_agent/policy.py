@@ -4,6 +4,7 @@ The model is not a security boundary. These checks are deliberately small and
 independent of prompt text so every file operation gets the same treatment.
 """
 
+import shlex
 from pathlib import Path
 
 # Names commonly containing credentials. Matching is case-insensitive and only
@@ -44,3 +45,45 @@ def check_path(raw_path: str, workspace: Path, *, write: bool = False) -> Path:
         operation = "write" if write else "read"
         raise ValueError(f"refusing to {operation} protected path: {path}")
     return path
+
+
+# --plan mode is read-only. The shell is only allowed to run these programs,
+# which only read. (Things like `sed`, `find`, `sort` and `rg` are left out on
+# purpose: each has an option that writes files or runs other programs, e.g.
+# `sed -i`, `find -delete`, `sort -o`, `rg --pre`.)
+READ_ONLY_COMMANDS = {"pwd", "ls", "cat", "head", "tail", "grep", "wc", "diff"}
+READ_ONLY_GIT_SUBCOMMANDS = {"status", "log", "diff", "show"}
+# Characters that let one command line write files or start extra commands:
+# `>` / `<` redirect, `;` and `&` chain commands, backticks and `$(` run a
+# command inside another. Pipes (`|`) are checked segment by segment instead.
+_SHELL_OPERATORS = (";", "&", ">", "<", "`", "$(", "\n")
+
+
+def plan_mode_refusal(command: str) -> str | None:
+    """Return why *command* is refused in --plan mode, or None if it is read-only.
+
+    This is a best-effort allowlist, not a sandbox: it stops a well-meaning model
+    from changing files by accident. A container is the real security boundary.
+    """
+    for operator in _SHELL_OPERATORS:
+        if operator in command:
+            return f"--plan mode is read-only; {operator!r} is not allowed in shell commands."
+    # `cat a.py | grep def` is fine as long as every piece is read-only.
+    for segment in command.split("|"):
+        try:
+            words = shlex.split(segment)
+        except ValueError as error:
+            return f"could not parse the command: {error}"
+        if not words:
+            return "--plan mode is read-only; empty pipeline segment."
+        program = words[0]
+        if program == "git":
+            subcommand = words[1] if len(words) > 1 else ""
+            if subcommand not in READ_ONLY_GIT_SUBCOMMANDS:
+                return f"--plan mode is read-only; `git {subcommand}` is not allowed."
+            if any(word.startswith("--output") for word in words):
+                return "--plan mode is read-only; git --output writes a file."
+        elif program not in READ_ONLY_COMMANDS:
+            allowed = ", ".join(sorted(READ_ONLY_COMMANDS | {"git"}))
+            return f"--plan mode is read-only; `{program}` is not allowed (allowed: {allowed})."
+    return None

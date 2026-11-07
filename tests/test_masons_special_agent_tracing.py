@@ -5,86 +5,18 @@ import json
 from pathlib import Path
 
 import pytest
-from openai.types.responses import (
-    Response,
-    ResponseFunctionToolCall,
-    ResponseOutputMessage,
-    ResponseOutputText,
-    ResponseUsage,
-)
-from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
+from fake_model import final_response, tool_response, use_fake_model
+from openai.types.responses import Response
 
 from agents590.contracts import RunContext
 from agents590.masons_special_agent import MasonsSpecialAgent
 
 
-def usage(input_tokens: int, cached: int, output_tokens: int) -> ResponseUsage:
-    return ResponseUsage(
-        input_tokens=input_tokens,
-        input_tokens_details=InputTokensDetails(cached_tokens=cached, cache_write_tokens=0),
-        output_tokens=output_tokens,
-        output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
-        total_tokens=input_tokens + output_tokens,
-    )
-
-
-def tool_response() -> Response:
-    call = ResponseFunctionToolCall(
-        type="function_call", call_id="call_1", name="shell", arguments='{"command": "pwd"}'
-    )
-    # model_construct skips validation, so the test only fills the fields the agent reads.
-    return Response.model_construct(output=[call], usage=usage(100, 40, 10))
-
-
-def final_response(text: str) -> Response:
-    message = ResponseOutputMessage(
-        id="msg_1",
-        type="message",
-        role="assistant",
-        status="completed",
-        content=[ResponseOutputText(type="output_text", text=text, annotations=[])],
-    )
-    return Response.model_construct(output=[message], usage=usage(150, 100, 5))
-
-
-class FakeResponses:
-    def __init__(self, replies: list[Response | Exception]) -> None:
-        self.replies = replies
-
-    async def create(self, **_: object) -> Response:
-        reply = self.replies.pop(0)
-        if isinstance(reply, Exception):
-            raise reply
-        return reply
-
-
-class FakeClient:
-    def __init__(self, replies: list[Response | Exception]) -> None:
-        self.responses = FakeResponses(replies)
-
-    async def __aenter__(self) -> "FakeClient":
-        return self
-
-    async def __aexit__(self, *_: object) -> None:
-        return None
-
-
-class FakeSettings:
-    model = "fake-model"
-
-    def __init__(self, replies: list[Response | Exception]) -> None:
-        self.replies = replies
-
-    def create_async_client(self) -> FakeClient:
-        return FakeClient(self.replies)
-
-
 def run_agent(
     replies: list[Response | Exception], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> str:
-    agent = MasonsSpecialAgent()
-    monkeypatch.setattr(agent, "provider_settings", lambda _context: FakeSettings(replies))
-    return asyncio.run(agent.run("say where you are", RunContext(cwd=tmp_path)))
+    use_fake_model(monkeypatch, replies)
+    return asyncio.run(MasonsSpecialAgent().run("say where you are", RunContext(cwd=tmp_path)))
 
 
 @pytest.fixture

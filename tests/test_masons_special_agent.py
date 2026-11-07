@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from openai.types.responses import ResponseFunctionToolCall
 
+from agents590.contracts import RunContext
 from agents590.masons_special_agent import MasonsSpecialAgent
 from agents590.masons_special_agent import agent as agent_module
 from agents590.masons_special_agent.agent import MAX_OUTPUT_CHARS, truncate
@@ -23,8 +24,9 @@ def call(name: str, arguments: object) -> ResponseFunctionToolCall:
     )
 
 
-def run_tool(action: ResponseFunctionToolCall, cwd: Path) -> str:
-    return asyncio.run(MasonsSpecialAgent().handle_tool_call(action, cwd))
+def run_tool(action: ResponseFunctionToolCall, cwd: Path, *, plan_only: bool = False) -> str:
+    context = RunContext(cwd=cwd, plan_only=plan_only)
+    return asyncio.run(MasonsSpecialAgent().handle_tool_call(action, context))
 
 
 def test_shell_reports_exit_code_stdout_and_stderr(tmp_path: Path) -> None:
@@ -127,3 +129,42 @@ def test_reading_a_long_file_warns_against_rewriting_it(tmp_path: Path) -> None:
 
     assert "[truncated" in output
     assert "Do not rewrite it with write_file" in output
+
+
+def test_plan_mode_refuses_write_file(tmp_path: Path) -> None:
+    action = call("write_file", {"path": "new.py", "content": "x = 1\n"})
+
+    output = run_tool(action, tmp_path, plan_only=True)
+
+    assert output.startswith("[error] write_file is disabled in --plan mode")
+    assert not (tmp_path / "new.py").exists()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm -rf src",
+        "touch x",
+        "echo hi > x",
+        "cat a; rm a",
+        "ls && touch x",
+        "cat $(touch x)",
+        "python3 -c 'print(1)'",
+        "sed -i s/a/b/ f.py",
+        "git commit -m x",
+        "git diff --output=x",
+        "cat a | tee b",
+    ],
+)
+def test_plan_mode_refuses_mutating_shell(tmp_path: Path, command: str) -> None:
+    output = run_tool(call("shell", {"command": command}), tmp_path, plan_only=True)
+
+    assert output.startswith("[error] --plan mode is read-only")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("command", ["pwd", "ls -la", "grep -rn def . | wc -l", "git status"])
+def test_plan_mode_allows_read_only_shell(tmp_path: Path, command: str) -> None:
+    output = run_tool(call("shell", {"command": command}), tmp_path, plan_only=True)
+
+    assert output.startswith("[exit code ")

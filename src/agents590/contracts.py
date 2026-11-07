@@ -11,15 +11,13 @@ class RunContext:
 
     cwd: Path
     model: str | None = None
+    # Read-only run: agents that support it must not change files.
     plan_only: bool = False
-    auto_approve: bool = False
     session: str | None = None
     run_id: str | None = None
     max_turns: int | None = None
     max_tool_calls: int | None = None
-    max_seconds: int | None = None
     state_dir: Path | None = None
-    vault: Path | None = None
 
 
 @runtime_checkable
