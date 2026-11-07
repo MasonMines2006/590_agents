@@ -43,9 +43,14 @@ def usage_metrics(response: Response) -> ATIFMetrics | None:
 class RunTracer:
     """Collect one run's steps and token totals."""
 
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, *, write_trajectory: bool = True) -> None:
         self.model = model
-        self.recorder = ATIFRecorder.from_environment(agent="masons_special_agent", model=model)
+        if write_trajectory:
+            self.recorder = ATIFRecorder.from_environment(agent="masons_special_agent", model=model)
+        else:
+            # A subagent must not write the trajectory file: it would overwrite
+            # the parent's. A path of None keeps the steps in memory only.
+            self.recorder = ATIFRecorder(None, agent="masons_special_agent", model=model)
         self.model_calls = 0
         self.totals: ATIFFinalMetrics = {
             "total_prompt_tokens": 0,
@@ -103,6 +108,24 @@ class RunTracer:
         observation = steps[-1].setdefault("observation", {"results": []})
         observation["results"].append({"source_call_id": call_id, "content": output})
         self.recorder.write()
+
+    def add_subagent_usage(self, subagent: "RunTracer") -> None:
+        """Add a finished subagent's token totals to this run's totals.
+
+        Without this, Harbor would only count the parent's tokens and
+        under-report what a run with subagents really used.
+        """
+        self.model_calls += subagent.model_calls
+        self.totals["total_prompt_tokens"] += subagent.totals["total_prompt_tokens"]
+        self.totals["total_completion_tokens"] += subagent.totals["total_completion_tokens"]
+        self.totals["total_cached_tokens"] += subagent.totals["total_cached_tokens"]
+        logger.info(
+            "subagent used %d model calls: input=%d cached=%d output=%d",
+            subagent.model_calls,
+            subagent.totals["total_prompt_tokens"],
+            subagent.totals["total_cached_tokens"],
+            subagent.totals["total_completion_tokens"],
+        )
 
     def finish(self) -> None:
         """Write the run's totals. Called from `finally`, so a crash still reports them."""

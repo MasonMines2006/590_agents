@@ -20,6 +20,7 @@ from agents590.masons_special_agent.policy import (
     check_path,
     plan_mode_refusal,
 )
+from agents590.masons_special_agent.skills import load_skill, skills_prompt
 from agents590.masons_special_agent.tracing import RunTracer, configure_logging, logger
 from agents590.provider import UNCOpenAISettings
 
@@ -55,6 +56,9 @@ SHELL_TIMEOUT_SECONDS = 60
 # Long outputs (a huge file, a noisy test run) would flood the model's context,
 # so every tool result is cut to this many characters.
 MAX_OUTPUT_CHARS = 10_000
+# The main agent (depth 0) may start subagents with the delegate tool, but a
+# subagent (depth 1) may not start its own. This stops runaway recursion.
+MAX_DELEGATION_DEPTH = 1
 # A repo's AGENTS.md goes into the system prompt on every model call, so cap it.
 MAX_AGENTS_MD_CHARS = 4_000
 
@@ -127,8 +131,34 @@ def resolve_path(raw_path: str, cwd: Path) -> Path:
     return path if path.is_absolute() else cwd / path
 
 
+# Offered only to agents that are allowed to delegate (see tool_definitions).
+DELEGATE_TOOL: FunctionToolParam = {
+    "type": "function",
+    "name": "delegate",
+    "description": (
+        "Give a self-contained subtask to a fresh subagent and return its final answer. "
+        "The subagent has the same tools and working directory but none of your "
+        "conversation, so describe the task fully. Use it for big, separate "
+        "investigations whose tool output you do not need to see yourself."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task": {"type": "string", "description": "The complete subtask description"},
+        },
+        "required": ["task"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
+
 class MasonsSpecialAgent:
-    """A model/tool loop with a whitelisted shell plus read_file and write_file."""
+    """A model/tool loop with a whitelisted shell, file tools, skills and subagents."""
+
+    def __init__(self, depth: int = 0) -> None:
+        # 0 for the agent the CLI starts; each delegate() call adds 1.
+        self.depth = depth
 
     tools: list[FunctionToolParam] = [
         {
@@ -180,7 +210,30 @@ class MasonsSpecialAgent:
             },
             "strict": True,
         },
+        {
+            "type": "function",
+            "name": "load_skill",
+            "description": "Return the full text of one of the skills listed in your instructions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The skill name, e.g. 'editing-large-files'",
+                    },
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        },
     ]
+
+    def tool_definitions(self) -> list[FunctionToolParam]:
+        """The tools this agent offers the model; subagents get no delegate tool."""
+        if self.depth < MAX_DELEGATION_DEPTH:
+            return [*self.tools, DELEGATE_TOOL]
+        return self.tools
 
     def provider_settings(self, context: RunContext) -> UNCOpenAISettings:
         """Prefer the per-run model to the environment's configured deployment."""
@@ -253,8 +306,35 @@ class MasonsSpecialAgent:
             return f"[error] Could not write {raw_path}: {error}"
         return f"Wrote {len(content)} characters to {path}"
 
-    async def handle_tool_call(self, action: ResponseFunctionToolCall, context: RunContext) -> str:
-        """Run one tool call and always return text for the model, even on errors."""
+    async def tool_delegate(self, task: str, context: RunContext, tracer: RunTracer | None) -> str:
+        """Run *task* in a fresh subagent and return its final answer."""
+        # The model only sees this tool when allowed, but check anyway: the
+        # model can still send a tool name it was not offered.
+        if self.depth >= MAX_DELEGATION_DEPTH:
+            return "[error] Subagents cannot delegate further; do the task yourself."
+        logger.info("delegate (depth %d): %s", self.depth + 1, truncate(task, 200))
+        subagent = MasonsSpecialAgent(depth=self.depth + 1)
+        sub_provider = subagent.provider_settings(context)
+        sub_tracer = RunTracer(model=sub_provider.model, write_trajectory=False)
+        try:
+            # Same cwd and limits (including --plan), but a brand-new conversation.
+            answer = await subagent.run_traced(sub_provider, sub_tracer, task, context)
+        finally:
+            # Count the subagent's tokens even if it crashed part-way.
+            if tracer is not None:
+                tracer.add_subagent_usage(sub_tracer)
+        return truncate(answer)
+
+    async def handle_tool_call(
+        self,
+        action: ResponseFunctionToolCall,
+        context: RunContext,
+        tracer: RunTracer | None = None,
+    ) -> str:
+        """Run one tool call and always return text for the model, even on errors.
+
+        *tracer* is the caller's tracer; delegate() adds the subagent's tokens to it.
+        """
         cwd = context.cwd
         # action.arguments is a JSON string like '{"command": "ls"}', not a dict.
         try:
@@ -269,6 +349,8 @@ class MasonsSpecialAgent:
         command = args.get("command")
         path = args.get("path")
         content = args.get("content")
+        name = args.get("name")
+        task = args.get("task")
 
         if action.name == "shell":
             if not isinstance(command, str):
@@ -292,17 +374,37 @@ class MasonsSpecialAgent:
                 return "[error] write_file is disabled in --plan mode (read-only)."
             logger.info("write_file %s (%d characters)", path, len(content))
             return self.tool_write_file(path, content, cwd)
+        if action.name == "load_skill":
+            if not isinstance(name, str):
+                return "[error] load_skill needs a 'name' string."
+            logger.info("load_skill %s", name)
+            return load_skill(name)
+        if action.name == "delegate":
+            if not isinstance(task, str) or not task.strip():
+                return "[error] delegate needs a non-empty 'task' string."
+            return await self.tool_delegate(task, context, tracer)
         logger.info("unknown tool %s", action.name)
         return f"[error] Unknown tool: {action.name}"
 
     async def run(self, instruction: str, context: RunContext) -> str:
         configure_logging()
         UNC_provider = self.provider_settings(context)
+        tracer = RunTracer(model=UNC_provider.model)
+        return await self.run_traced(UNC_provider, tracer, instruction, context)
+
+    async def run_traced(
+        self,
+        UNC_provider: UNCOpenAISettings,
+        tracer: RunTracer,
+        instruction: str,
+        context: RunContext,
+    ) -> str:
+        """Run the task with a tracer chosen by the caller (run() or tool_delegate())."""
         instructions = SYSTEM_PROMPT.format(commands=", ".join(ALLOWED_COMMANDS))
+        instructions += skills_prompt()
         instructions += project_conventions(context.cwd)
         if context.plan_only:
             instructions += PLAN_MODE_PROMPT.format(commands=", ".join(sorted(READ_ONLY_COMMANDS)))
-        tracer = RunTracer(model=UNC_provider.model)
         tracer.record_instruction(instruction)
 
         # `finally` runs even if the API call or a tool crashes, so the token
@@ -331,7 +433,7 @@ class MasonsSpecialAgent:
                     model=UNC_provider.model,
                     input=items,
                     store=False,
-                    tools=self.tools,
+                    tools=self.tool_definitions(),
                     background=False,
                     instructions=instructions,
                 )
@@ -354,7 +456,7 @@ class MasonsSpecialAgent:
                         logger.info("stopping: reached --max-tool-calls %d", limit)
                         return f"Stopped: reached the limit of {limit} tool calls."
                     tool_calls_made += 1
-                    output = await self.handle_tool_call(action, context)
+                    output = await self.handle_tool_call(action, context, tracer)
                     tracer.record_tool_result(action.call_id, output)
                     items += [
                         {
