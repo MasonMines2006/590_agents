@@ -102,3 +102,60 @@ def test_missing_paths_fail_before_loading_an_agent(tmp_path: Path, option: str)
     with pytest.raises(SystemExit) as error:
         cli.main(["krisj_echo", "-i", "test", option, str(tmp_path / "missing")])
     assert error.value.code == 2
+
+
+def test_plain_run_writes_no_state_folder(tmp_path: Path) -> None:
+    # Harbor runs the CLI exactly like this, with cwd set to the task repo.
+    assert cli.main(["krisj_echo", "-i", "hello", "--cwd", str(tmp_path)]) == 0
+
+    assert not (tmp_path / ".agents590").exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_session_run_writes_records_in_the_state_dir(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+
+    exit_code = cli.main(
+        ["krisj_echo", "-i", "hello", "--cwd", str(tmp_path), "--session", "x"]
+        + ["--state-dir", str(state)]
+    )
+
+    assert exit_code == 0
+    assert (state / "session-x.json").is_file()
+    manifests = list(state.glob("runs/*/manifest.json"))
+    assert len(manifests) == 1
+    assert '"status": "completed"' in manifests[0].read_text()
+
+
+def test_session_without_state_dir_uses_cwd_agents590(tmp_path: Path) -> None:
+    assert cli.main(["krisj_echo", "-i", "hi", "--cwd", str(tmp_path), "--session", "s"]) == 0
+
+    assert (tmp_path / ".agents590" / "session-s.json").is_file()
+
+
+def test_unwritable_state_dir_fails_with_a_friendly_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A regular file where the state directory should be makes mkdir fail.
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+
+    exit_code = cli.main(["krisj_echo", "-i", "hi", "--state-dir", str(blocker / "state")])
+
+    assert exit_code == 1
+    assert "could not save run records" in capsys.readouterr().err
+
+
+def test_unexpected_agent_errors_print_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class CrashingAgent:
+        async def run(self, instruction: str, context: RunContext) -> str:
+            raise RuntimeError("model service down")
+
+    monkeypatch.setattr(cli, "create_agent", lambda _name: CrashingAgent())
+
+    assert cli.main(["crashing", "-i", "test"]) == 1
+    err = capsys.readouterr().err
+    assert "Traceback" in err
+    assert "agents590: model service down" in err

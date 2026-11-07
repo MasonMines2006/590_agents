@@ -5,6 +5,7 @@ import asyncio
 import json
 import sys
 import time
+import traceback
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -138,6 +139,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if vault is not None and not vault.is_dir():
         parser.error("--vault must name an existing directory")
 
+    # Only touch the disk when the user asked for persistence. A plain
+    # `agents590 <agent> -i "..."` run (how Harbor calls us, with cwd = the task
+    # repo) must not leave a `.agents590/` folder behind, because some task
+    # verifiers check that `git status` is clean.
+    wants_persistence = bool(args.state_dir or args.session or args.resume)
+
     run_store: RunStore | None = None
     instruction = args.instruction
     if args.resume:
@@ -159,25 +166,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error(str(error))
     model_instruction = _session_instruction(instruction, history)
     run_id = args.resume or uuid.uuid4().hex[:12]
-    if run_store is None:
-        run_store = RunStore.start(
-            state_dir,
-            run_id,
-            {
-                "agent": args.agent,
-                "instruction": instruction,
-                "cwd": str(cwd),
-                "session": args.session,
-                "model": args.model,
-                "vault": str(vault) if vault else None,
-            },
-        )
-    else:
-        run_store.event("run_resumed", {"instruction": instruction})
+    try:
+        if run_store is not None:
+            run_store.event("run_resumed", {"instruction": instruction})
+        elif wants_persistence:
+            run_store = RunStore.start(
+                state_dir,
+                run_id,
+                {
+                    "agent": args.agent,
+                    "instruction": instruction,
+                    "cwd": str(cwd),
+                    "session": args.session,
+                    "model": args.model,
+                    "vault": str(vault) if vault else None,
+                },
+            )
+    except OSError as error:
+        # For example, a read-only working directory. Say so plainly instead of
+        # crashing with a traceback before the agent even starts.
+        print(f"agents590: could not save run records in {state_dir}: {error}", file=sys.stderr)
+        return 1
 
-    # Keep the original context contract for callers that did not request a
-    # persistent session; persistence itself is still enabled by default.
-    context_run_id = run_id if (args.state_dir or args.session or args.resume) else None
+    # Agents only see a run id when the run is actually being recorded.
+    context_run_id = run_id if wants_persistence else None
     context_state_dir = args.state_dir.expanduser().resolve() if args.state_dir else None
     context = RunContext(
         cwd=cwd,
@@ -196,14 +208,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         output = asyncio.run(create_agent(args.agent).run(model_instruction, context))
     except KeyboardInterrupt:
-        run_store.finish("interrupted", error="interrupted by user")
+        if run_store is not None:
+            run_store.finish("interrupted", error="interrupted by user")
         return 130
+    except (ValueError, TypeError, NotImplementedError) as error:
+        # Expected, explainable failures (unknown agent, bad settings, an
+        # unimplemented scaffold): a one-line message is enough.
+        if run_store is not None:
+            run_store.finish("failed", error=str(error))
+        print(f"agents590: {error}", file=sys.stderr)
+        return 1
     except Exception as error:
-        run_store.finish("failed", error=str(error))
+        # Anything else is a bug or an outage. Print the full traceback to
+        # stderr so a crashed Harbor trial can still be debugged from its logs.
+        if run_store is not None:
+            run_store.finish("failed", error=str(error))
+        traceback.print_exc()
         print(f"agents590: {error}", file=sys.stderr)
         return 1
     elapsed = time.monotonic() - started
-    run_store.finish("completed", output=output)
+    if run_store is not None:
+        run_store.finish("completed", output=output)
     record = {
         "run_id": run_id,
         "agent": args.agent,
