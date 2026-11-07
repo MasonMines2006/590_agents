@@ -12,3 +12,6 @@ build/
 .env.*
 !.env.example
 .DS_Store
+
+# Local agent run records and session transcripts (written by --session/--state-dir).
+.agents590/
