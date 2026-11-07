@@ -73,6 +73,11 @@ NON_INTERACTIVE_ENV = {
     "PYTHONDONTWRITEBYTECODE": "1",
 }
 
+# The agent itself needs the API key, but the commands it runs never do. Removing
+# these from the shell's environment means `python3 -c "import os; ..."` (or a
+# test that prints its environment) cannot leak the key into the transcript.
+SECRET_ENV_VARS = {"OPENAI_API_KEY", "AZURE_OPENAI_API_KEY"}
+
 SYSTEM_PROMPT = """You are a careful coding agent working in a repository.
 
 Work in this order:
@@ -123,6 +128,12 @@ def project_conventions(cwd: Path) -> str:
         return ""
     logger.info("loaded AGENTS.md (%d characters)", len(text))
     return "\n\nProject conventions (from AGENTS.md):\n" + truncate(text, MAX_AGENTS_MD_CHARS)
+
+
+def shell_environment() -> dict[str, str]:
+    """The environment for shell commands: ours, minus secrets, plus non-interactive settings."""
+    inherited = {key: value for key, value in os.environ.items() if key not in SECRET_ENV_VARS}
+    return {**inherited, **NON_INTERACTIVE_ENV}
 
 
 def resolve_path(raw_path: str, cwd: Path) -> Path:
@@ -259,7 +270,7 @@ class MasonsSpecialAgent:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
-            env={**os.environ, **NON_INTERACTIVE_ENV},
+            env=shell_environment(),
             start_new_session=True,
         )
         try:

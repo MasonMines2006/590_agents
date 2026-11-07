@@ -109,6 +109,24 @@ the strict `[tool.pyright]` configuration in `pyproject.toml`; VS Code uses
 `py.typed`. `make clean` removes generated caches and build output while keeping
 the virtual environment and `.env`.
 
+## Local isolation (`make sandbox`)
+
+Harbor already runs agents inside Docker. Local runs (`agents590-chat` on your own
+machine) do not, so run them with `make sandbox`: it opens a shell in a throwaway
+container where only this repo is mounted, `.env` is passed as environment variables
+but hidden as a file, and the container is deleted on exit. See the comments on the
+target in the `Makefile`.
+
+The container is the real security boundary. `masons_special_agent`'s shell
+allowlist only checks a command's first word, and allowed programs such as
+`python3`, `make`, `uv`, `pytest` and `git` can run arbitrary code (for example
+`python3 -c "print(open('.env').read())"`), so no first-word allowlist can be safe
+while they are allowed. What the agent does enforce: `read_file`/`write_file` stay
+inside `--cwd` and refuse secret-looking names such as `.env`; shell commands do not
+inherit `OPENAI_API_KEY`/`AZURE_OPENAI_API_KEY`; and `--plan` limits the shell to a
+small read-only allowlist. Treat these as guard rails against accidents, not against
+a determined model.
+
 ## Evaluate through Harbor
 
 The sibling `evals/` repository supplies the generic installed-agent adapter:

@@ -168,3 +168,16 @@ def test_plan_mode_allows_read_only_shell(tmp_path: Path, command: str) -> None:
     output = run_tool(call("shell", {"command": command}), tmp_path, plan_only=True)
 
     assert output.startswith("[exit code ")
+
+
+def test_shell_commands_cannot_see_the_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy-key-for-test")
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "dummy-key-for-test")
+    command = "python3 -c \"import os; print(sorted(k for k in os.environ if 'API_KEY' in k))\""
+
+    output = run_tool(call("shell", {"command": command}), tmp_path)
+
+    assert "[stdout]\n[]" in output
+    assert "dummy-key-for-test" not in output
