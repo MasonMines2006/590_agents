@@ -19,6 +19,7 @@ from agents590.masons_special_agent.policy import (
     READ_ONLY_COMMANDS,
     check_path,
     plan_mode_refusal,
+    shell_refusal,
 )
 from agents590.masons_special_agent.redaction import SECRET_ENV_VARS, redact
 from agents590.masons_special_agent.shell_output import read_bounded
@@ -280,11 +281,12 @@ class MasonsSpecialAgent:
         cwd: Path,
         whitelist: list[str] = ALLOWED_COMMANDS,
     ) -> str:
-        words = cmd.split()
-        if not words:
+        if not cmd.strip():
             return "[error] Empty command."
-        if words[0] not in whitelist:
-            return f"[error] Command not allowed: {words[0]}"
+        # Checks every program in a pipeline and refuses `;`, `&&`, `$(...)`.
+        refusal = shell_refusal(cmd, set(whitelist))
+        if refusal is not None:
+            return f"[error] {refusal}"
 
         # i got this from https://docs.python.org/3/library/asyncio-subprocess.html#asyncio.create_subprocess_shell
         # start_new_session puts the shell and everything it starts (pytest, etc.)

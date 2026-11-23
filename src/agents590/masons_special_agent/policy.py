@@ -59,6 +59,73 @@ READ_ONLY_GIT_SUBCOMMANDS = {"status", "log", "diff", "show"}
 _SHELL_OPERATORS = (";", "&", ">", "<", "`", "$(", "\n")
 
 
+# Outside plan mode, redirects (`>`, `<`) are fine, but these would let one
+# command line start a second program that the allowlist never checks:
+# `cat x; curl y`, `ls && rm -rf .`, `(curl y)`. Inside quotes they are just
+# text (`python3 -c "import os; print(1)"` is one command), so the check uses
+# a shell-style tokenizer instead of searching the raw string.
+_CHAINING_TOKENS = {";", ";;", "&", "&&", "||", "(", ")"}
+
+
+def _substitution_outside_single_quotes(command: str) -> str | None:
+    """Find `$(`, a backtick or a bare newline that the shell would act on.
+
+    The shell runs `$(...)` and backticks even inside double quotes, so only
+    single quotes make them harmless. A newline outside quotes starts a new command.
+    """
+    in_single = in_double = escaped = False
+    for index, char in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and not in_single:
+            escaped = True
+        elif char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and (char == "`" or command.startswith("$(", index)):
+            return "command substitution ($(...) or backticks)"
+        elif char == "\n" and not in_single and not in_double:
+            return "a second line"
+    return None
+
+
+def shell_refusal(command: str, allowed: set[str]) -> str | None:
+    """Return why *command* is refused in normal mode, or None if it may run.
+
+    Every program in a pipeline must be on the allowlist, not just the first
+    one, and chaining a second command is refused. Like plan mode, this is a
+    best-effort guard against a model's mistakes, not a sandbox.
+    """
+    found = _substitution_outside_single_quotes(command)
+    if found is not None:
+        return f"{found} is not allowed: run one command (pipes with | are fine)."
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError as error:
+        return f"could not parse the command: {error}"
+    # Split the token list into pipeline segments and check each program.
+    segment: list[str] = []
+    segments: list[list[str]] = [segment]
+    for token in tokens:
+        if token in _CHAINING_TOKENS:
+            return f"{token!r} is not allowed: run one command (pipes with | are fine)."
+        if token == "|":
+            segment = []
+            segments.append(segment)
+        else:
+            segment.append(token)
+    for words in segments:
+        if not words:
+            return "empty pipeline segment."
+        if words[0] not in allowed:
+            return f"Command not allowed: {words[0]}"
+    return None
+
+
 def plan_mode_refusal(command: str) -> str | None:
     """Return why *command* is refused in --plan mode, or None if it is read-only.
 

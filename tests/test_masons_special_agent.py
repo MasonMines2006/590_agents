@@ -113,7 +113,7 @@ def test_timeout_stops_child_processes(tmp_path: Path, monkeypatch: pytest.Monke
     monkeypatch.setattr(agent_module, "SHELL_TIMEOUT_SECONDS", 1)
     marker = tmp_path / "still_running.txt"
     # The child sleeps past the timeout and then writes a file, unless it was killed.
-    command = f"python3 -c \"import time; time.sleep(2); open('{marker}', 'w').write('x')\"; true"
+    command = f"python3 -c \"import time; time.sleep(2); open('{marker}', 'w').write('x')\" | cat"
 
     output = run_tool(call("shell", {"command": command}), tmp_path)
     time.sleep(2)
