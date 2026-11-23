@@ -13,8 +13,20 @@ from typing import cast
 from openai.types.responses import Response, ResponseFunctionToolCall
 
 from agents590.atif import ATIFFinalMetrics, ATIFMetrics, ATIFRecorder, ATIFToolCall, JSONValue
+from agents590.masons_special_agent.redaction import redact
 
 logger = logging.getLogger("agents590.masons_special_agent")
+
+
+class RedactSecrets(logging.Filter):
+    """Blank out API keys in every log line before it is written."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # getMessage() fills in the %s arguments; store the cleaned result so the
+        # handler doesn't format the original arguments again.
+        record.msg = redact(record.getMessage())
+        record.args = None
+        return True  # keep the line (just cleaned)
 
 
 def configure_logging() -> None:
@@ -22,6 +34,7 @@ def configure_logging() -> None:
     if logger.handlers:
         return
     handler = logging.StreamHandler(sys.stderr)
+    handler.addFilter(RedactSecrets())
     handler.setFormatter(logging.Formatter("[masons_special_agent] %(message)s"))
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)

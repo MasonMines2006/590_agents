@@ -20,6 +20,8 @@ from agents590.masons_special_agent.policy import (
     check_path,
     plan_mode_refusal,
 )
+from agents590.masons_special_agent.redaction import SECRET_ENV_VARS, redact
+from agents590.masons_special_agent.shell_output import read_bounded
 from agents590.masons_special_agent.skills import load_skill, skills_prompt
 from agents590.masons_special_agent.tracing import RunTracer, configure_logging, logger
 from agents590.provider import UNCOpenAISettings
@@ -56,6 +58,16 @@ SHELL_TIMEOUT_SECONDS = 60
 # Long outputs (a huge file, a noisy test run) would flood the model's context,
 # so every tool result is cut to this many characters.
 MAX_OUTPUT_CHARS = 10_000
+# Shell output budget per stream (stdout and stderr each get half of the total),
+# keeping the start and the end of the output. See shell_output.py.
+MAX_SHELL_OUTPUT_BYTES = MAX_OUTPUT_CHARS // 2
+# A time limit for the WHOLE run (every model call and tool call together), so a
+# stuck run ends with a clear message instead of hanging. From Yewon's agent,
+# which used 100 s; ours is longer because our shell timeout is 60 s, not 10 s.
+RUN_TIMEOUT_SECONDS = 600
+# Cap on how many tokens one model reply may produce. Higher than Yewon's 1024
+# because write_file sends whole files as one tool-call argument.
+MAX_OUTPUT_TOKENS = 8192
 # The main agent (depth 0) may start subagents with the delegate tool, but a
 # subagent (depth 1) may not start its own. This stops runaway recursion.
 MAX_DELEGATION_DEPTH = 1
@@ -74,9 +86,9 @@ NON_INTERACTIVE_ENV = {
 }
 
 # The agent itself needs the API key, but the commands it runs never do. Removing
-# these from the shell's environment means `python3 -c "import os; ..."` (or a
-# test that prints its environment) cannot leak the key into the transcript.
-SECRET_ENV_VARS = {"OPENAI_API_KEY", "AZURE_OPENAI_API_KEY"}
+# SECRET_ENV_VARS (defined in redaction.py) from the shell's environment means
+# `python3 -c "import os; ..."` (or a test that prints its environment) cannot
+# leak the key into the transcript.
 
 SYSTEM_PROMPT = """You are a careful coding agent working in a repository.
 
@@ -128,6 +140,24 @@ def project_conventions(cwd: Path) -> str:
         return ""
     logger.info("loaded AGENTS.md (%d characters)", len(text))
     return "\n\nProject conventions (from AGENTS.md):\n" + truncate(text, MAX_AGENTS_MD_CHARS)
+
+
+async def stop_process_group(
+    proc: asyncio.subprocess.Process, readers: list["asyncio.Task[str]"]
+) -> None:
+    """Kill a shell and every process it started, then stop reading its pipes.
+
+    proc.kill() alone would only stop the shell and leave children (pytest,
+    a server, ...) running. start_new_session=True gave them all one process
+    group, so killpg stops the whole group. (Yewon's agent does the same.)
+    """
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    await proc.wait()
+    for reader in readers:
+        reader.cancel()
+    # return_exceptions=True: we expect CancelledError here and don't want it raised.
+    await asyncio.gather(*readers, return_exceptions=True)
 
 
 def shell_environment() -> dict[str, str]:
@@ -261,32 +291,37 @@ class MasonsSpecialAgent:
         # in their own process group, so a timeout can stop all of them at once.
         proc = await asyncio.create_subprocess_shell(
             cmd,
+            stdin=asyncio.subprocess.DEVNULL,  # nobody can type into it, so never wait for input
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
             env=shell_environment(),
             start_new_session=True,
         )
+        assert proc.stdout is not None and proc.stderr is not None
+        # Read both pipes at the same time while the command runs. Each stream
+        # keeps at most MAX_SHELL_OUTPUT_BYTES (its start and its end), so a huge
+        # stdout can never push the error message in stderr out.
+        readers = [
+            asyncio.create_task(read_bounded(proc.stdout, MAX_SHELL_OUTPUT_BYTES)),
+            asyncio.create_task(read_bounded(proc.stderr, MAX_SHELL_OUTPUT_BYTES)),
+        ]
         try:
             async with asyncio.timeout(SHELL_TIMEOUT_SECONDS):
-                stdout, stderr = await proc.communicate()
-        except TimeoutError:
-            # proc.kill() alone would only stop the shell and leave its children running.
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            await proc.wait()
+                await proc.wait()
+                stdout, stderr = await asyncio.gather(*readers)
+        except (TimeoutError, asyncio.CancelledError) as error:
+            # CancelledError happens when the whole run hits RUN_TIMEOUT_SECONDS
+            # mid-command. Either way, stop the command and everything it started.
+            await stop_process_group(proc, readers)
+            if isinstance(error, asyncio.CancelledError):
+                raise
             logger.info("shell %r timed out", cmd)
             return f"[error] The command timed out after {SHELL_TIMEOUT_SECONDS} seconds: {cmd}"
 
         logger.info("shell %r exited with %s", cmd, proc.returncode)
-        # Always send the exit code and both streams. Each stream gets half the
-        # budget, so a huge stdout can never push the error message in stderr out.
-        half = MAX_OUTPUT_CHARS // 2
-        return (
-            f"[exit code {proc.returncode}]\n"
-            f"[stdout]\n{truncate(stdout.decode(errors='replace'), half)}\n"
-            f"[stderr]\n{truncate(stderr.decode(errors='replace'), half)}"
-        )
+        # Always send the exit code and both streams.
+        return f"[exit code {proc.returncode}]\n[stdout]\n{stdout}\n[stderr]\n{stderr}"
 
     def tool_read_file(self, raw_path: str, cwd: Path) -> str:
         try:
@@ -427,6 +462,24 @@ class MasonsSpecialAgent:
         context: RunContext,
         tracer: RunTracer,
     ) -> str:
+        """Run the model/tool loop, stopping if the whole run takes too long."""
+        try:
+            async with asyncio.timeout(RUN_TIMEOUT_SECONDS):
+                return await self.model_tool_loop(
+                    UNC_provider, instructions, instruction, context, tracer
+                )
+        except TimeoutError:
+            logger.info("stopping: run went over %s seconds", RUN_TIMEOUT_SECONDS)
+            return f"Stopped: the run went over its {RUN_TIMEOUT_SECONDS}-second time limit."
+
+    async def model_tool_loop(
+        self,
+        UNC_provider: UNCOpenAISettings,
+        instructions: str,
+        instruction: str,
+        context: RunContext,
+        tracer: RunTracer,
+    ) -> str:
         async with UNC_provider.create_async_client() as UNC_client:
             items: list[Any] = [{"role": "user", "content": instruction}]
             # `or` falls back to the default when the flag was not given (None).
@@ -441,8 +494,20 @@ class MasonsSpecialAgent:
                     tools=self.tool_definitions(),
                     background=False,
                     instructions=instructions,
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                    # One tool call per reply keeps each step easy to follow in the trace.
+                    parallel_tool_calls=False,
                 )
                 tracer.record_response(UNC_client_response)
+
+                # A reply cut off by max_output_tokens (or failed) may hold a
+                # half-written tool call, so don't run it. (Status checks from Yewon's
+                # agent.) Test fakes leave status as None, which is treated as fine.
+                status = UNC_client_response.status
+                if status not in (None, "completed"):
+                    logger.info("stopping: model reply status=%s", status)
+                    return f"Stopped: the model reply did not complete (status={status})."
+
                 actions: list[ResponseFunctionToolCall] = []
                 for action in UNC_client_response.output:
                     if isinstance(action, ResponseFunctionToolCall):
@@ -450,6 +515,9 @@ class MasonsSpecialAgent:
 
                 # no pending actions, so were done!
                 if not actions:
+                    if not UNC_client_response.output_text.strip():
+                        logger.info("stopping: empty model reply")
+                        return "Stopped: the model returned neither a tool call nor an answer."
                     return UNC_client_response.output_text
 
                 items += UNC_client_response.output
@@ -461,7 +529,9 @@ class MasonsSpecialAgent:
                         logger.info("stopping: reached --max-tool-calls %d", limit)
                         return f"Stopped: reached the limit of {limit} tool calls."
                     tool_calls_made += 1
-                    output = await self.handle_tool_call(action, context, tracer)
+                    # redact() blanks out API keys before the model, the ATIF
+                    # file or the logs can see them (e.g. after `cat .env`).
+                    output = redact(await self.handle_tool_call(action, context, tracer))
                     tracer.record_tool_result(action.call_id, output)
                     items += [
                         {
